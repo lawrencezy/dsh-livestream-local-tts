@@ -1,0 +1,391 @@
+# 生产接入补丁（未应用）：本机 TTS provider + runtime.ts speech 分支 + worker
+# 目标：<DSH_PLUGIN_DIR>
+# 应用：cd <目标包> && patch -p1 < production.patch
+
+--- a/src/dsh/runtime.ts
++++ b/src/dsh/runtime.ts
+@@ -24,6 +24,9 @@
+ import { Packs } from '../body/packs';
+ import { StageServer } from '../body/server';
+ import { canSpeak, subtitleTimeline, synthesize, type TtsAuth } from '../body/tts';
++import { localSpeech, localTtsEnabled } from '../body/ttsLocal';
++
++export { warmLocalTts } from '../body/ttsLocal';
+ import { DEFAULT_VOICE } from '../body/voices';
+ import type { DistillLlm } from '../core/memory/distill';
+ import type { CharacterManifest, GameSource } from '../stage/protocol';
+@@ -293,6 +296,17 @@
+ publishNotice();
+ 
+ async function speech(text: string, signal: AbortSignal, voice = currentVoice()): Promise<{ audio: Uint8Array; timeline: Array<{ chars: number; atMs: number }> } | null> {
++  // 本机离线 provider：显式开启才走；失败/没开就回落到原来的豆包路径
++  if (localTtsEnabled()) {
++    try {
++      const local = await localSpeech(text, signal);
++      if (local) return local;
++      hooks.log('warn', '本地 TTS 没有返回音频，回落到豆包');
++    } catch (err) {
++      if (signal.aborted) return null;
++      hooks.log('warn', `本地 TTS 失败，回落到豆包：${(err as Error).message}`);
++    }
++  }
+   const auth = await ttsAuth(voice);
+   if (!auth) return null;
+   const { audio, words } = await synthesize(auth, voice, text, signal);
+
+--- a/src/body/ttsLocal.ts
++++ b/src/body/ttsLocal.ts
+@@ -0,0 +1,255 @@
++/**
++ * 本机离线 TTS provider（Qwen3-TTS CustomVoice）：不联网、不花钱。
++ *
++ * 只在 DSH_LOCAL_TTS=1 时启用；默认不启用，豆包路径原样保留。
++ * 常驻一个 Python worker（模型只加载一次），每句把文本发过去，拿回 WAV，
++ * 用 ffmpeg 转成 mp3（舞台 `<audio>` 按 audio/mpeg 播放），再按字数均匀生成 timeline。
++ *
++ * 环境变量：
++ *   DSH_LOCAL_TTS=1                       启用
++ *   DSH_LOCAL_TTS_PYTHON                  解释器（默认 python）
++ *   DSH_LOCAL_TTS_WORKER                  worker 脚本路径（必填，隔离副本里的 tools/local_tts_worker.py）
++ *   DSH_LOCAL_TTS_MODEL                   模型目录
++ *   DSH_LOCAL_TTS_SPEAKER                 预设音色（默认 Serena）
++ *   DSH_LOCAL_TTS_CACHE                   产物目录（默认系统临时目录下 dsh-local-tts）
++ */
++
++import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
++import { createHash } from 'node:crypto';
++import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++
++export interface LocalSpeech {
++  audio: Uint8Array;
++  timeline: Array<{ chars: number; atMs: number }>;
++}
++
++export interface LocalTtsMeta {
++  source: 'qwen3-tts-local';
++  text: string;
++  speaker: string;
++  model: string;
++  sampleRate: number;
++  durationSeconds: number;
++  peakAbs: number;
++  wavSha256: string;
++  mp3Sha256: string;
++  mp3Bytes: number;
++  workerGenerateSeconds: number;
++  generatedAt: string;
++  cached: boolean;
++}
++
++export function localTtsEnabled(): boolean {
++  return process.env.DSH_LOCAL_TTS === '1';
++}
++
++const PYTHON = process.env.DSH_LOCAL_TTS_PYTHON || 'python';
++const WORKER = process.env.DSH_LOCAL_TTS_WORKER || '';
++const MODEL = process.env.DSH_LOCAL_TTS_MODEL || 'models/Qwen3-TTS-12Hz-0.6B-CustomVoice';
++const SPEAKER = process.env.DSH_LOCAL_TTS_SPEAKER || 'Serena';
++const CACHE = process.env.DSH_LOCAL_TTS_CACHE || join(tmpdir(), 'dsh-local-tts');
++
++interface WorkerLine {
++  id?: string;
++  ready?: boolean;
++  ok?: boolean;
++  error?: string;
++  sample_rate?: number;
++  duration_seconds?: number;
++  peak?: number;
++  wav?: string;
++  generate_seconds?: number;
++  load_seconds?: number;
++  model?: string;
++  speaker?: string;
++}
++
++interface Job {
++  resolve: (value: WorkerLine) => void;
++  reject: (error: Error) => void;
++}
++
++let proc: ChildProcessWithoutNullStreams | null = null;
++let pending = new Map<string, Job>();
++let buffer = '';
++let ready: Promise<void> | null = null;
++let seq = 0;
++
++function startWorker(): void {
++  const child = spawn(PYTHON, ['-u', WORKER], {
++    env: {
++      ...process.env,
++      PYTHONIOENCODING: 'utf-8',
++      HF_HUB_OFFLINE: '1',
++      TRANSFORMERS_OFFLINE: '1',
++      DSH_LOCAL_TTS_MODEL: MODEL,
++      DSH_LOCAL_TTS_SPEAKER: SPEAKER,
++    },
++    stdio: ['pipe', 'pipe', 'pipe'],
++  });
++  proc = child;
++  buffer = '';
++  child.stdout.setEncoding('utf8');
++  child.stdout.on('data', (chunk: string) => {
++    buffer += chunk;
++    let cut = buffer.indexOf('\n');
++    while (cut >= 0) {
++      const line = buffer.slice(0, cut).trim();
++      buffer = buffer.slice(cut + 1);
++      if (line) dispatch(line);
++      cut = buffer.indexOf('\n');
++    }
++  });
++  let stderr = '';
++  child.stderr.setEncoding('utf8');
++  child.stderr.on('data', (chunk: string) => {
++    stderr = (stderr + chunk).slice(-4000);
++  });
++  child.on('exit', (code) => {
++    const error = new Error(`本地 TTS worker 退出（${code}）：${stderr.slice(-400)}`);
++    for (const job of pending.values()) job.reject(error);
++    pending = new Map();
++    proc = null;
++    ready = null;
++  });
++}
++
++function dispatch(line: string): void {
++  let message: WorkerLine;
++  try {
++    message = JSON.parse(line) as WorkerLine;
++  } catch {
++    return;
++  }
++  if (message.ready) return;
++  const id = message.id ?? '';
++  const job = pending.get(id);
++  if (!job) return;
++  pending.delete(id);
++  if (message.ok) job.resolve(message);
++  else job.reject(new Error(`本地 TTS 失败：${message.error ?? 'unknown'}`));
++}
++
++function ensureWorker(): Promise<void> {
++  if (!WORKER) return Promise.reject(new Error('DSH_LOCAL_TTS_WORKER 未设置'));
++  if (!existsSync(WORKER)) return Promise.reject(new Error(`本地 TTS worker 不存在：${WORKER}`));
++  if (ready) return ready;
++  startWorker();
++  const child = proc!;
++  const pendingReady = new Promise<void>((resolve, reject) => {
++    const timer = setTimeout(() => reject(new Error('本地 TTS worker 启动超时（30s）')), 30_000);
++    const onData = (chunk: string) => {
++      if (!chunk.includes('"ready"')) return;
++      clearTimeout(timer);
++      child.stdout.off('data', onData);
++      resolve();
++    };
++    child.stdout.on('data', onData);
++    child.on('exit', () => {
++      clearTimeout(timer);
++      reject(new Error('本地 TTS worker 启动即退出'));
++    });
++  }).catch((error) => {
++    ready = null;
++    throw error;
++  });
++  ready = pendingReady;
++  return pendingReady;
++}
++
++/** 启动时就加载模型（3 秒左右），别让第一句等太久 */
++export function warmLocalTts(): Promise<void> {
++  if (!localTtsEnabled()) return Promise.resolve();
++  return ensureWorker().catch((error) => {
++    console.warn(`[dsh-livestream] 本地 TTS 预热失败：${(error as Error).message}`);
++  });
++}
++
++if (localTtsEnabled()) void warmLocalTts();
++
++function hashKey(text: string): string {
++  return createHash('sha256').update(`${SPEAKER}|${text}`).digest('hex').slice(0, 16);
++}
++
++function transcode(wav: string, mp3: string): void {
++  execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', wav, '-codec:a', 'libmp3lame', '-b:a', '64k', '-ac', '1', mp3], { stdio: 'ignore', timeout: 20_000 });
++}
++
++/** 生成一句；失败返回 null（调用方回落到豆包/静音），不改变契约 */
++export async function localSpeech(text: string, signal: AbortSignal): Promise<LocalSpeech | null> {
++  if (!localTtsEnabled() || !text.trim()) return null;
++  await ensureWorker();
++  if (signal.aborted) return null;
++  mkdirSync(CACHE, { recursive: true });
++  const key = hashKey(text);
++  const wav = join(CACHE, `${key}.wav`);
++  const mp3 = join(CACHE, `${key}.mp3`);
++  const metaFile = join(CACHE, `${key}.json`);
++  let meta: LocalTtsMeta | null = null;
++  if (existsSync(metaFile) && existsSync(mp3)) {
++    try {
++      meta = { ...(JSON.parse(readFileSync(metaFile, 'utf8')) as LocalTtsMeta), cached: true };
++    } catch {
++      meta = null;
++    }
++  }
++  if (!meta) {
++    const id = `${Date.now()}-${seq++}`;
++    let onAbort: (() => void) | null = null;
++    const request = new Promise<WorkerLine>((resolve, reject) => {
++      pending.set(id, { resolve, reject });
++      onAbort = () => {
++        // 只让这一次调用失败；不要杀 worker（上一句的 abort 会在它已经完成后误杀下一句）
++        pending.delete(id);
++        reject(new Error('aborted'));
++      };
++      signal.addEventListener('abort', onAbort, { once: true });
++    });
++    try {
++      proc!.stdin.write(`${JSON.stringify({ id, text, wav })}\n`);
++      const reply = await request;
++      transcode(wav, mp3);
++      const mp3Bytes = readFileSync(mp3);
++      meta = {
++        source: 'qwen3-tts-local',
++        text,
++        speaker: reply.speaker ?? SPEAKER,
++        model: reply.model ?? MODEL,
++        sampleRate: reply.sample_rate ?? 24000,
++        durationSeconds: reply.duration_seconds ?? 0,
++        peakAbs: reply.peak ?? 0,
++        wavSha256: createHash('sha256').update(readFileSync(wav)).digest('hex'),
++        mp3Sha256: createHash('sha256').update(mp3Bytes).digest('hex'),
++        mp3Bytes: mp3Bytes.length,
++        workerGenerateSeconds: reply.generate_seconds ?? 0,
++        generatedAt: new Date().toISOString(),
++        cached: false,
++      };
++      writeFileSync(metaFile, JSON.stringify(meta, null, 2));
++    } finally {
++      if (onAbort) signal.removeEventListener('abort', onAbort);
++    }
++  }
++  const audio = readFileSync(mp3);
++  const chars = [...text].length;
++  const durationMs = Math.max(200, Math.round((meta.durationSeconds || 1) * 1000));
++  const timeline = Array.from({ length: chars }, (_, i) => ({ chars: i + 1, atMs: Math.round((durationMs * (i + 1)) / chars) }));
++  return { audio, timeline };
++}
++
++/** 交付自检用：本次进程里本地 TTS 产生的元数据（不含音频本体） */
++export function localTtsAudit(): LocalTtsMeta[] {
++  if (!existsSync(CACHE)) return [];
++  return readdirSync(CACHE)
++    .filter((name) => name.endsWith('.json'))
++    .map((name) => {
++      try {
++        return JSON.parse(readFileSync(join(CACHE, name), 'utf8')) as LocalTtsMeta;
++      } catch {
++        return null;
++      }
++    })
++    .filter((item): item is LocalTtsMeta => item !== null);
++}
+
+--- a/tools/local_tts_worker.py
++++ b/tools/local_tts_worker.py
+@@ -0,0 +1,94 @@
++"""本机 Qwen3-TTS worker：模型加载一次，之后逐行读 JSON 请求、逐行回 JSON。
++
++stdin:  {"id": "...", "text": "...", "wav": "绝对路径.wav"}
++stdout: {"ready": true, ...} 然后每句 {"id": "...", "ok": true, "sample_rate": 24000, ...}
++
++全离线：local_files_only=True + HF_HUB_OFFLINE=1；不下载、不联网。
++0.6B CustomVoice 的 instruct 会被置空，这里不传情绪指令。
++"""
++
++import json
++import os
++import sys
++import time
++
++import numpy as np
++import soundfile as sf
++import torch
++from qwen_tts import Qwen3TTSModel
++
++MODEL = os.environ.get('DSH_LOCAL_TTS_MODEL', 'models/Qwen3-TTS-12Hz-0.6B-CustomVoice')
++SPEAKER = os.environ.get('DSH_LOCAL_TTS_SPEAKER', 'Serena')
++
++
++def emit(payload):
++    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + '\n')
++    sys.stdout.flush()
++
++
++def main():
++    started = time.time()
++    model = Qwen3TTSModel.from_pretrained(
++        MODEL,
++        device_map='cuda:0',
++        dtype=torch.bfloat16,
++        attn_implementation='sdpa',
++        local_files_only=True,
++    )
++    emit({'ready': True, 'model': MODEL, 'speaker': SPEAKER, 'load_seconds': round(time.time() - started, 3)})
++    while True:
++        line = sys.stdin.readline()
++        if not line:
++            break
++        line = line.strip()
++        if not line:
++            continue
++        request = json.loads(line)
++        request_id = request.get('id', '')
++        try:
++            text = str(request.get('text', '')).strip()
++            if not text:
++                raise ValueError('empty text')
++            began = time.time()
++            torch.manual_seed(20261115)
++            wavs, sr = model.generate_custom_voice(
++                text=text,
++                language='Chinese',
++                speaker=SPEAKER,
++                max_new_tokens=500,
++                do_sample=True,
++                top_k=50,
++                top_p=1.0,
++                temperature=0.75,
++                repetition_penalty=1.05,
++            )
++            audio = np.asarray(wavs[0], dtype=np.float32)
++            if audio.ndim != 1:
++                audio = audio.reshape(-1)
++            if not np.isfinite(audio).all():
++                raise ValueError('non-finite samples')
++            peak = float(np.max(np.abs(audio)))
++            if not 0.01 < peak < 1.01:
++                raise ValueError(f'bad peak {peak}')
++            out = str(request.get('wav', ''))
++            if not out:
++                raise ValueError('missing wav path')
++            os.makedirs(os.path.dirname(out), exist_ok=True)
++            sf.write(out, audio, int(sr), subtype='PCM_16')
++            emit({
++                'id': request_id,
++                'ok': True,
++                'model': MODEL,
++                'speaker': SPEAKER,
++                'sample_rate': int(sr),
++                'duration_seconds': round(len(audio) / int(sr), 3),
++                'peak': peak,
++                'wav': out,
++                'generate_seconds': round(time.time() - began, 3),
++            })
++        except Exception as error:  # noqa: BLE001 - worker 不能因为一句失败就退出
++            emit({'id': request_id, 'ok': False, 'error': f'{type(error).__name__}: {error}'})
++
++
++if __name__ == '__main__':
++    main()
