@@ -58,4 +58,4 @@ export DSH_LOCAL_TTS_SPEAKER=Serena
 ## 相关
 
 - 上游：https://github.com/luckui/dsh-livestream
-- 教程视频：制作完成后把链接放到这里；视频里的演示角色来自上游，仅作学习演示，不随本仓库分发。
+- 教程视频：2 分 41 秒竖屏教程已完成（2026-11-15）；发布链接待补。
